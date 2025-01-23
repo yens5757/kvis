@@ -2,10 +2,10 @@ import asyncio
 import time
 
 
-from globals import global_hashmap, expiry_hashmap, slaves, slaves_write_count
 from config import server_config
+from globals import global_hashmap, expiry_hashmap
 from parsers import parse_input
-from replication import write_to_slave, slave_read_loop, wait_for_slaves
+from rdb import parse_metadata
 
 async def handle_client(reader, writer):
     """
@@ -173,6 +173,148 @@ async def handle_client(reader, writer):
             await writer.drain()
 
 
+async def connect_to_master(host, port):
+    """
+    Establish a master slaves connections as well as the data dump.
+    """
+    print(f"[Replica] Attempting to connect to master at {host}:{port}")
+    try:
+        reader, writer = await asyncio.open_connection(host, port)
+
+        # 1) Basic handshake: send a PING
+        writer.write(b"*1\r\n$4\r\nPING\r\n")
+        await writer.drain()
+        response = await reader.read(1024)
+        data, _ = parse_input(response)
+        if data != "PONG":
+            print("[Replica] Master did not respond PONG; aborting replication.")
+            writer.close()
+            await writer.wait_closed()
+            return
+
+        # 2) Send REPLCONF listening-port
+        port_str = server_config["port"] or "6379"
+        msg = (
+            f"*3\r\n$8\r\nREPLCONF\r\n$14\r\nlistening-port\r\n${len(port_str)}\r\n{port_str}\r\n"
+        ).encode()
+        writer.write(msg)
+        await writer.drain()
+        response = await reader.read(1024)
+        data, _ = parse_input(response)
+        if data != "OK":
+            print("[Replica] Master did not accept REPLCONF listening-port; aborting.")
+            writer.close()
+            await writer.wait_closed()
+            return
+
+        # 3) Send REPLCONF capa psync2
+        writer.write(b"*3\r\n$8\r\nREPLCONF\r\n$4\r\ncapa\r\n$6\r\npsync2\r\n")
+        await writer.drain()
+        response = await reader.read(1024)
+        data, _ = parse_input(response)
+        if data != "OK":
+            print("[Replica] Master did not accept REPLCONF capa psync2; aborting.")
+            writer.close()
+            await writer.wait_closed()
+            return
+
+        # 4) Send PSYNC ? -1
+        writer.write(b"*3\r\n$5\r\nPSYNC\r\n$1\r\n?\r\n$2\r\n-1\r\n")
+        await writer.drain()
+
+        # 5) Expect a full resync response + some RDB-like data
+        #    We'll read an initial chunk to see if it includes RDB data.
+        rdb_chunk = await reader.read(4096)
+        if not rdb_chunk:
+            print("[Replica] No data received after PSYNC request.")
+            writer.close()
+            await writer.wait_closed()
+            return
+
+        # 6) Attempt to find and parse the RDB chunk within `rdb_chunk`.
+        redis_header_index = rdb_chunk.find(b"REDIS")
+        if redis_header_index == -1:
+            print("[Replica] No 'REDIS' magic found in the initial PSYNC data chunk.")
+            writer.close()
+            await writer.wait_closed()
+            return
+
+        # Check if we have enough bytes for "REDISxxx" (5 + 4 = 9 bytes).
+        if redis_header_index + 9 > len(rdb_chunk):
+            print("[Replica] Not enough data to read REDIS header + version.")
+            writer.close()
+            await writer.wait_closed()
+            return
+
+        header = rdb_chunk[redis_header_index : redis_header_index + 9]
+        magic, version = header[:5].decode("ascii"), header[5:].decode("ascii")
+        print(f"[Replica] Detected RDB header: magic={magic}, version={version}")
+
+        if magic != "REDIS" or not version.isdigit():
+            print("[Replica] The data does not appear to be a valid RDB header.")
+            writer.close()
+            await writer.wait_closed()
+            return
+
+        # 7) Now parse the rest as metadata (like your parse_metadata approach).
+        #    We skip the first part up to index + 9 bytes, because that's the header.
+        rdb_body = rdb_chunk[redis_header_index + 9 :]
+
+        leftover = parse_metadata(rdb_body)
+
+        # leftover might contain partial or extra data after the RDB has ended.
+        # For instance, if the RDB ended with 0xFF marker (and optional checksum),
+        # leftover could include any subsequent data.
+
+        if leftover:
+            print(f"[Replica] Some leftover bytes after parsing the RDB: {len(leftover)} bytes")
+
+        # 8) Start a loop to continuously read additional updates/commands from master.
+        #    Typically, after the master sends the RDB, it begins sending commands (e.g. "SET" ...).
+        get_ack_offset = len(rdb_chunk)  # We can treat that as the initial offset
+        while True:
+            new_data = await reader.read(1024)
+            if not new_data:
+                print("[Replica] Master closed the connection.")
+                writer.close()
+                await writer.wait_closed()
+                break
+
+            get_ack_offset += len(new_data)
+
+            # 8a) Try to parse the newly-arrived data as RESP commands
+            leftover2 = new_data
+            while leftover2:
+                parsed, leftover2 = parse_input(leftover2)
+                if not parsed:
+                    break
+
+                if isinstance(parsed, list) and len(parsed) > 0:
+                    sub_cmd = parsed[0].upper()
+                    if sub_cmd == "REPLCONF" and len(parsed) >= 2 and parsed[1].upper() == "ACK":
+                        # Typically the master doesn't send that, but let's just respond:
+                        ack_str = (
+                            f"*3\r\n$8\r\nREPLCONF\r\n$3\r\nACK\r\n"
+                            f"${len(str(get_ack_offset))}\r\n{get_ack_offset}\r\n"
+                        )
+                        writer.write(ack_str.encode())
+                        await writer.drain()
+
+                    elif sub_cmd == "SET" and len(parsed) >= 3:
+                        # Master is replicating a SET
+                        key = parsed[1]
+                        value = parsed[2]
+                        global_hashmap[key] = value
+                        # If "px" is specified, handle expiry
+                        if len(parsed) > 3 and parsed[3].lower() == "px":
+                            px_ms = int(parsed[4])
+                            expiry_time = time.time() + px_ms / 1000.0
+                            expiry_hashmap[key] = expiry_time
+
+    except Exception as e:
+        print(f"[Replica] Error connecting to or syncing with master: {e}")
+
+
 async def main():
     """
     The main async entrypoint. Starts the server.
@@ -188,6 +330,7 @@ async def main():
     # If configured as a replica, also connect to master
     if server_config["replicaof"]:
         host, port_str = server_config["replicaof"].split()
+        replication_task = asyncio.create_task(connect_to_master(host, int(port_str)))
 
     async with server:
         await server.serve_forever()
