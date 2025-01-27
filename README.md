@@ -1,5 +1,5 @@
-# Redis-Like Server
-This is a simple redis that allows core commands, key expiry, RDB persistence and master-replica synchronization.
+# KVIS
+KVIS is a simple key-value storage system inspired by Redis, offering core commands, key expiry, RDB-like persistence, and master-replica synchronization.
 
 # How to use
 1. Clone/Download this repository (or place the files in a folder).
