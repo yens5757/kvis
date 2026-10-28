@@ -1,4 +1,5 @@
 import asyncio
+import fnmatch
 
 from parsers import parse_input, IncompleteError, encode_bulk_string, encode_array
 from replication import write_to_slave, slave_read_loop, wait_for_slaves
@@ -21,31 +22,45 @@ async def handle_client(reader, writer):
     Handle an individual client connection.
     """
     buffer = b""
-    while True:
-        data = await reader.read(1024)
-        if not data:
-            print("Client disconnected")
-            writer.close()
-            await writer.wait_closed()
-            break
-        buffer += data
-
-        # One read can hold several commands, or only part of one
-        while buffer:
-            try:
-                result, leftover = parse_input(buffer)
-            except IncompleteError:
+    try:
+        while True:
+            data = await reader.read(1024)
+            if not data:
+                print("Client disconnected")
                 break
-            raw = buffer[:len(buffer) - len(leftover)]
-            buffer = leftover
+            buffer += data
 
-            if not isinstance(result, list) or not result:
-                continue
+            # One read can hold several commands, or only part of one
+            while buffer:
+                try:
+                    result, leftover = parse_input(buffer)
+                except IncompleteError:
+                    break
+                raw = buffer[:len(buffer) - len(leftover)]
+                buffer = leftover
 
-            if await handle_command(result, raw, reader, writer):
-                # This connection now belongs to a slave; hand it over with any unread bytes
-                asyncio.create_task(slave_read_loop(reader, writer, buffer))
-                return
+                if not isinstance(result, list) or not result:
+                    continue
+
+                try:
+                    became_slave = await handle_command(result, raw, reader, writer)
+                except (IndexError, ValueError):
+                    writer.write(f"-ERR wrong arguments for '{result[0]}' command\r\n".encode())
+                    await writer.drain()
+                    continue
+
+                if became_slave:
+                    # This connection now belongs to a slave; hand it over with any unread bytes
+                    asyncio.create_task(slave_read_loop(reader, writer, buffer))
+                    return
+
+    except ValueError as e:
+        writer.write(b"-ERR Protocol error\r\n")
+        print(f"Protocol error from client: {e}")
+    except ConnectionError:
+        print("Client connection lost")
+
+    writer.close()
 
 
 async def handle_command(result, raw, reader, writer):
@@ -79,17 +94,21 @@ async def handle_command(result, raw, reader, writer):
         await writer.drain()
 
     # CONFIG GET
-    elif cmd == "CONFIG" and result[1].upper() == "GET":
-        param = result[2].lower()
-        if param in ("dir", "dbfilename"):
+    elif cmd == "CONFIG":
+        if result[1].upper() != "GET":
+            writer.write(f"-ERR unknown subcommand '{result[1]}'\r\n".encode())
+        elif result[2].lower() in ("dir", "dbfilename"):
+            param = result[2].lower()
             writer.write(encode_array([param, server_config[param] or ""]))
+        else:
+            writer.write(b"*0\r\n")
         await writer.drain()
 
     # KEYS
     elif cmd == "KEYS":
-        if result[1] == "*":
-            writer.write(encode_array(live_keys()))
-            await writer.drain()
+        keys = [k for k in live_keys() if fnmatch.fnmatchcase(k, result[1])]
+        writer.write(encode_array(keys))
+        await writer.drain()
 
     # INFO
     elif cmd == "INFO":
@@ -123,6 +142,10 @@ async def handle_command(result, raw, reader, writer):
     elif cmd == "WAIT":
         await wait_for_slaves(int(result[1]), int(result[2]))
         writer.write(f":{slaves_write_count}\r\n".encode())
+        await writer.drain()
+
+    else:
+        writer.write(f"-ERR unknown command '{result[0]}'\r\n".encode())
         await writer.drain()
 
     return False

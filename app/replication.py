@@ -172,7 +172,10 @@ async def connect_to_master(host, port):
                                         await writer.drain()
 
                                     elif cmd == "SET":
-                                        apply_set(result)
+                                        try:
+                                            apply_set(result)
+                                        except (IndexError, ValueError):
+                                            print(f"Ignoring invalid SET from master: {result}")
 
                                 if buffer:
                                     result, buffer = parse_input(buffer)

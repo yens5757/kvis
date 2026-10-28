@@ -6,10 +6,13 @@ from globals import global_hashmap, expiry_hashmap
 def apply_set(args):
     """
     Apply a SET command: SET <key> <value> [px <milliseconds>].
+    Raises IndexError/ValueError on missing or invalid arguments, before changing anything.
     """
     key, value = args[1], args[2]
     expires_at = None
-    if len(args) > 3 and args[3].lower() == "px":
+    if len(args) > 3:
+        if len(args) != 5 or args[3].lower() != "px":
+            raise ValueError("syntax error")
         expires_at = time.time() + int(args[4]) / 1000
 
     global_hashmap[key] = value
