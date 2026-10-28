@@ -1,10 +1,10 @@
 import asyncio
-import time
 
 from parsers import parse_input
 from replication import write_to_slave, slave_read_loop, wait_for_slaves
-from globals import global_hashmap, expiry_hashmap, slaves, slaves_write_count
+from globals import slaves, slaves_write_count
 from config import server_config
+from store import apply_set, get_value, live_keys
 
 
 async def handle_client(reader, writer):
@@ -37,25 +37,16 @@ async def handle_client(reader, writer):
 
         # SET
         elif cmd == "SET":
+            apply_set(result)
             await write_to_slave(data)
-            global_hashmap[result[1]] = result[2]
             writer.write(b"+OK\r\n")
             await writer.drain()
 
-            # If expiration is set
-            if len(result) > 3 and result[3].lower() == "px" and result[1] in global_hashmap:
-                expiry_hashmap[result[1]] = time.time() + (int(result[4]) / 1000)
-
         # GET
         elif cmd == "GET":
-            if result[1] in global_hashmap:
-                now = time.time()
-                if (result[1] not in expiry_hashmap) or (expiry_hashmap[result[1]] > now):
-                    val = global_hashmap[result[1]]
-                    writer.write(f"${len(val)}\r\n{val}\r\n".encode())
-                else:
-                    # Key is expired
-                    writer.write(b"$-1\r\n")
+            val = get_value(result[1])
+            if val is not None:
+                writer.write(f"${len(val)}\r\n{val}\r\n".encode())
             else:
                 writer.write(b"$-1\r\n")
             await writer.drain()
@@ -73,7 +64,7 @@ async def handle_client(reader, writer):
         # KEYS
         elif cmd == "KEYS":
             if result[1] == "*":
-                keys = list(global_hashmap.keys())
+                keys = live_keys()
                 resp = f"*{len(keys)}\r\n"
                 for k in keys:
                     resp += f"${len(k)}\r\n{k}\r\n"

@@ -2,8 +2,9 @@ import asyncio
 import time
 
 from parsers import parse_input
-from globals import slaves, slaves_write_count, global_hashmap, expiry_hashmap
+from globals import slaves, slaves_write_count
 from config import server_config
+from store import apply_set
 
 
 async def slave_read_loop(reader, writer):
@@ -167,9 +168,7 @@ async def connect_to_master(host, port):
                                         await writer.drain()
 
                                     elif cmd == "SET":
-                                        global_hashmap[result[1]] = result[2]
-                                        if len(result) > 3 and result[3] == "px" and result[1] in global_hashmap:
-                                            expiry_hashmap[result[1]] = time.time() + (int(result[4]) / 1000)
+                                        apply_set(result)
 
                                 if buffer:
                                     result, buffer = parse_input(buffer)
