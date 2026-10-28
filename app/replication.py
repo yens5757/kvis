@@ -2,9 +2,16 @@ import asyncio
 import time
 
 from parsers import parse_input, parse_rdb_payload, encode_array, IncompleteError
-from globals import slaves, slaves_write_count
+from globals import slaves
 from rdb import load_rdb
 from store import apply_set
+
+# Total bytes this master has propagated to its slaves.
+repl_offset = 0
+
+
+def get_repl_offset():
+    return repl_offset
 
 
 async def slave_read_loop(reader, writer, buffer=b""):
@@ -19,11 +26,11 @@ async def slave_read_loop(reader, writer, buffer=b""):
                     parsed, buffer = parse_input(buffer)
                 except IncompleteError:
                     break
-                if isinstance(parsed, list) and len(parsed) >= 2:
+                if isinstance(parsed, list) and len(parsed) >= 3:
                     cmd = str(parsed[0]).upper()
                     if cmd == "REPLCONF" and str(parsed[1]).upper() == "ACK":
                         if (reader, writer) in slaves:
-                            slaves[(reader, writer)] += 1
+                            slaves[(reader, writer)] = int(parsed[2])
 
             data = await reader.read(1024)
             if not data:
@@ -33,19 +40,16 @@ async def slave_read_loop(reader, writer, buffer=b""):
     except Exception as e:
         print(f"Error in slave read loop: {e}")
     finally:
-        if (reader, writer) in slaves:
-            del slaves[(reader, writer)]
+        slaves.pop((reader, writer), None)
         writer.close()
-        await writer.wait_closed()
 
 
 async def write_to_slave(data):
     """
     Forward the given 'data' to all connected slaves.
     """
-    global slaves_write_count
-    for key in slaves:
-        slaves[key] = 0  # reset acknowledgments
+    global repl_offset
+    repl_offset += len(data)
 
     for reader, writer in list(slaves.keys()):
         try:
@@ -53,30 +57,30 @@ async def write_to_slave(data):
             await writer.drain()
         except Exception as e:
             print(f"Error forwarding to slave: {e}")
-            del slaves[(reader, writer)]
+            slaves.pop((reader, writer), None)
 
 
 async def wait_for_slaves(count, timeout):
     """
-    Wait for 'count' slaves to ACK or until 'timeout' ms passes.
+    Wait until 'count' slaves have acknowledged every write so far, or until 'timeout' ms
+    passes (0 waits forever). Returns the number of slaves that acknowledged.
     """
-    global slaves_write_count
-    start_time = time.time()
+    target = repl_offset
 
-    # Ask each slave for ACK
-    for reader, writer in slaves:
-        writer.write(b"*3\r\n$8\r\nREPLCONF\r\n$6\r\nGETACK\r\n$1\r\n*\r\n")
-        await writer.drain()
+    def acked():
+        return sum(1 for offset in slaves.values() if offset >= target)
 
-    while True:
-        acks = sum(1 for v in slaves.values() if v >= 1)
-        slaves_write_count = acks
-        if slaves_write_count >= count:
-            print("ok")
-            return
-        if time.time() - start_time >= timeout / 1000:
-            return
+    if acked() >= count:
+        return acked()
+
+    # Ask each slave for its offset. GETACK is part of the replication stream itself,
+    # so it advances the offset, but slaves report the offset from before it.
+    await write_to_slave(encode_array(["REPLCONF", "GETACK", "*"]))
+
+    deadline = time.time() + timeout / 1000
+    while acked() < count and (timeout == 0 or time.time() < deadline):
         await asyncio.sleep(0.01)
+    return acked()
 
 
 async def read_reply(reader, buffer, parser=parse_input):
@@ -123,11 +127,11 @@ async def connect_to_master(host, port, own_port):
             print(f"Unexpected reply to PSYNC from master: {reply}")
             return
 
+        # FULLRESYNC <replid> <offset>: the stream continues from the master's offset
+        offset = int(reply.split()[2])
+
         rdb, buffer = await read_reply(reader, buffer, parse_rdb_payload)
         load_rdb(rdb)
-
-        # Bytes of the replication stream processed so far, reported back on GETACK
-        offset = 0
 
         # Keep reading subsequent replication commands
         while True:

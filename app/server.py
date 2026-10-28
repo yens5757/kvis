@@ -2,8 +2,8 @@ import asyncio
 import fnmatch
 
 from parsers import parse_input, IncompleteError, encode_bulk_string, encode_array
-from replication import write_to_slave, slave_read_loop, wait_for_slaves
-from globals import slaves, slaves_write_count
+from replication import write_to_slave, slave_read_loop, wait_for_slaves, get_repl_offset
+from globals import slaves
 from config import server_config
 from store import apply_set, get_value, live_keys
 
@@ -117,7 +117,7 @@ async def handle_command(result, raw, reader, writer):
             info = "role:slave"
         else:
             # Master info
-            info = f"role:master\r\nmaster_replid:{MASTER_REPLID}\r\nmaster_repl_offset:0"
+            info = f"role:master\r\nmaster_replid:{MASTER_REPLID}\r\nmaster_repl_offset:{get_repl_offset()}"
         writer.write(encode_bulk_string(info))
         await writer.drain()
 
@@ -125,23 +125,24 @@ async def handle_command(result, raw, reader, writer):
     elif cmd == "REPLCONF":
         writer.write(b"+OK\r\n")
         await writer.drain()
-        if result[1].lower() == "listening-port" and len(result) > 2:
-            slaves[(reader, writer)] = 1
 
     # PSYNC
     elif cmd == "PSYNC":
         # Full sync scenario
-        writer.write(f"+FULLRESYNC {MASTER_REPLID} 0\r\n".encode())
+        writer.write(f"+FULLRESYNC {MASTER_REPLID} {get_repl_offset()}\r\n".encode())
         await writer.drain()
 
         writer.write(f"${len(EMPTY_RDB)}\r\n".encode() + EMPTY_RDB)
         await writer.drain()
+
+        # Only register the slave once it has the RDB, so no writes are forwarded mid-handshake
+        slaves[(reader, writer)] = get_repl_offset()
         return True
 
     # WAIT
     elif cmd == "WAIT":
-        await wait_for_slaves(int(result[1]), int(result[2]))
-        writer.write(f":{slaves_write_count}\r\n".encode())
+        acked = await wait_for_slaves(int(result[1]), int(result[2]))
+        writer.write(f":{acked}\r\n".encode())
         await writer.drain()
 
     else:
