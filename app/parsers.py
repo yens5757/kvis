@@ -1,77 +1,74 @@
-class IncompleteError(Exception):
-    """
-    Raised when the buffer does not yet hold a complete RESP value.
-    """
+# Largest bulk string accepted, as in Redis (proto-max-bulk-len).
+MAX_BULK_LENGTH = 512 * 1024 * 1024
+
+# Deepest array nesting accepted. Commands are flat arrays, so this only stops abuse.
+MAX_NESTING = 8
 
 
-def parse_input(data):
+async def read_value(reader):
     """
-    Redis protocol parser (RESP).
-    Returns (parsed_result, leftover_bytes).
-    Raises IncompleteError if 'data' ends before the first value is complete.
+    Read one RESP value from an asyncio StreamReader.
+    The reader buffers incoming data itself, so a value split across several network
+    reads (or several values in one read) is handled without copying the data again.
+    Returns (parsed_result, raw_bytes), where raw_bytes is the value exactly as received.
+    Raises asyncio.IncompleteReadError if the connection closes, and ValueError or
+    asyncio.LimitOverrunError on malformed input.
     """
-    if not data:
-        raise IncompleteError()
+    chunks = []
+    value = await _read_value(reader, chunks, 0)
+    return value, b"".join(chunks)
 
-    line_end = data.find(b"\r\n")
-    if line_end == -1:
-        raise IncompleteError()
 
-    first_byte = data[0:1]
-    line = data[1:line_end]
-    rest = data[line_end + 2:]
+async def _read_value(reader, chunks, depth):
+    line = await reader.readuntil(b"\r\n")
+    chunks.append(line)
+    first_byte, body = line[0:1], line[1:-2]
 
     if first_byte == b"+":  # Simple String
-        return line.decode(), rest
+        return body.decode()
 
     elif first_byte == b"-":  # Error
-        return {"error": line.decode()}, rest
+        return {"error": body.decode()}
 
     elif first_byte == b":":  # Integer
-        return int(line), rest
+        return int(body)
 
     elif first_byte == b"$":  # Bulk String
-        length = int(line)
+        length = int(body)
         if length == -1:
-            return None, rest  # Null bulk string
-        if len(rest) < length + 2:
-            raise IncompleteError()
-        return rest[:length].decode(), rest[length + 2:]
+            return None  # Null bulk string
+        if not 0 <= length <= MAX_BULK_LENGTH:
+            raise ValueError(f"Invalid bulk length: {length}")
+        data = await reader.readexactly(length + 2)
+        if data[-2:] != b"\r\n":
+            raise ValueError("Bulk string not terminated by CRLF")
+        chunks.append(data)
+        return data[:-2].decode()
 
     elif first_byte == b"*":  # Array
-        num_elements = int(line)
+        num_elements = int(body)
         if num_elements == -1:
-            return None, rest  # Null array
+            return None  # Null array
+        if num_elements < 0 or depth >= MAX_NESTING:
+            raise ValueError("Invalid array")
         result = []
         for _ in range(num_elements):
-            element, rest = parse_input(rest)
-            result.append(element)
-        return result, rest
+            result.append(await _read_value(reader, chunks, depth + 1))
+        return result
 
     else:
         raise ValueError("Unknown RESP type")
 
 
-def parse_rdb_payload(data):
+async def read_rdb_payload(reader):
     """
-    Parse the RDB file a master sends after FULLRESYNC: "$<length>\\r\\n" followed by
+    Read the RDB file a master sends after FULLRESYNC: "$<length>\\r\\n" followed by
     exactly <length> raw bytes, with no trailing CRLF.
-    Returns (rdb_bytes, leftover_bytes).
     """
-    if not data:
-        raise IncompleteError()
-    if data[0:1] != b"$":
+    line = await reader.readuntil(b"\r\n")
+    if line[0:1] != b"$":
         raise ValueError("Expected RDB payload from master")
-
-    line_end = data.find(b"\r\n")
-    if line_end == -1:
-        raise IncompleteError()
-
-    length = int(data[1:line_end])
-    start = line_end + 2
-    if len(data) < start + length:
-        raise IncompleteError()
-    return data[start:start + length], data[start + length:]
+    return await reader.readexactly(int(line[1:-2]))
 
 
 def encode_bulk_string(value):
