@@ -1,31 +1,35 @@
 import asyncio
 import time
 
-from parsers import parse_input
+from parsers import parse_input, IncompleteError
 from globals import slaves, slaves_write_count
 from config import server_config
 from store import apply_set
 
 
-async def slave_read_loop(reader, writer):
+async def slave_read_loop(reader, writer, buffer=b""):
     """
     Continuously reads data from a slave connection.
+    'buffer' holds any bytes already read from the connection but not yet parsed.
     """
     try:
         while True:
+            while buffer:
+                try:
+                    parsed, buffer = parse_input(buffer)
+                except IncompleteError:
+                    break
+                if isinstance(parsed, list) and len(parsed) >= 2:
+                    cmd = str(parsed[0]).upper()
+                    if cmd == "REPLCONF" and str(parsed[1]).upper() == "ACK":
+                        if (reader, writer) in slaves:
+                            slaves[(reader, writer)] += 1
+
             data = await reader.read(1024)
             if not data:
                 print("Slave disconnected")
                 break
-
-            leftover = data
-            while leftover:
-                parsed, leftover = parse_input(leftover)
-                if isinstance(parsed, list) and len(parsed) >= 2:
-                    cmd = parsed[0].upper()
-                    if cmd == "REPLCONF" and parsed[1].upper() == "ACK":
-                        if (reader, writer) in slaves:
-                            slaves[(reader, writer)] += 1
+            buffer += data
     except Exception as e:
         print(f"Error in slave read loop: {e}")
     finally:

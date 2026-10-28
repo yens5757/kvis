@@ -1,49 +1,52 @@
+class IncompleteError(Exception):
+    """
+    Raised when the buffer does not yet hold a complete RESP value.
+    """
+
+
 def parse_input(data):
     """
     Redis protocol parser (RESP).
     Returns (parsed_result, leftover_bytes).
+    Raises IncompleteError if 'data' ends before the first value is complete.
     """
     if not data:
-        raise ValueError("No data to parse")
+        raise IncompleteError()
 
-    first_byte = data[0]
+    line_end = data.find(b"\r\n")
+    if line_end == -1:
+        raise IncompleteError()
 
-    if first_byte == b"+"[0]:  # Simple String
-        return data[1:].decode().strip(), b""
+    first_byte = data[0:1]
+    line = data[1:line_end]
+    rest = data[line_end + 2:]
 
-    elif first_byte == b"-"[0]:  # Error
-        return {"error": data[1:].decode().strip()}, b""
+    if first_byte == b"+":  # Simple String
+        return line.decode(), rest
 
-    elif first_byte == b":"[0]:  # Integer
-        return int(data[1:].strip()), b""
+    elif first_byte == b"-":  # Error
+        return {"error": line.decode()}, rest
 
-    elif first_byte == b"$"[0]:  # Bulk String
-        lines = data.split(b"\r\n")
-        length = int(lines[0][1:])
+    elif first_byte == b":":  # Integer
+        return int(line), rest
+
+    elif first_byte == b"$":  # Bulk String
+        length = int(line)
         if length == -1:
-            return None, b""  # Null bulk string
-        return lines[1].decode(), b""
+            return None, rest  # Null bulk string
+        if len(rest) < length + 2:
+            raise IncompleteError()
+        return rest[:length].decode(), rest[length + 2:]
 
-    elif first_byte == b"*"[0]:  # Array
-        lines = data.split(b"\r\n")
-        num_elements = int(lines[0][1:])
-        if num_elements == 0:
-            return [], b""  # Empty array
+    elif first_byte == b"*":  # Array
+        num_elements = int(line)
+        if num_elements == -1:
+            return None, rest  # Null array
         result = []
-        i = 1
-        processed_length = len(lines[0]) + 2
-
-        while i < num_elements * 2:
-            line = lines[i]
-            processed_length += len(line) + 2
-            if line.startswith(b"$"):
-                result.append(lines[i + 1].decode())
-                processed_length += len(lines[i + 1]) + 2
-                i += 1
-            i += 1
-
-        leftover_data = data[processed_length:]
-        return result, leftover_data
+        for _ in range(num_elements):
+            element, rest = parse_input(rest)
+            result.append(element)
+        return result, rest
 
     else:
         raise ValueError("Unknown RESP type")
