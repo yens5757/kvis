@@ -3,105 +3,95 @@ import os
 from globals import meta_data, global_hashmap, expiry_hashmap
 from config import server_config
 
+def read_bytes(data, offset, size):
+    """
+    Read exactly 'size' bytes starting at 'offset'.
+    Returns (bytes, new_offset).
+    """
+    if offset + size > len(data):
+        raise IndexError("Unexpected end of RDB data")
+    return data[offset:offset + size], offset + size
+
+
+def read_length(data, offset):
+    """
+    Read an RDB length-encoded value starting at 'offset'.
+    Returns (value, is_special, new_offset). When is_special is True, 'value' is a
+    special string format (0-3) rather than a length.
+    """
+    first = data[offset]
+    kind = first >> 6
+    if kind == 0:  # 6-bit length
+        return first & 0x3F, False, offset + 1
+    if kind == 1:  # 14-bit length
+        return ((first & 0x3F) << 8) | data[offset + 1], False, offset + 2
+    if kind == 2:
+        if first == 0x80:  # 32-bit length
+            raw, offset = read_bytes(data, offset + 1, 4)
+            return int.from_bytes(raw, "big"), False, offset
+        if first == 0x81:  # 64-bit length
+            raw, offset = read_bytes(data, offset + 1, 8)
+            return int.from_bytes(raw, "big"), False, offset
+        raise ValueError(f"Unsupported length encoding: {first:#04x}")
+    return first & 0x3F, True, offset + 1
+
+
+def read_string(data, offset):
+    """
+    Read an RDB string (plain or integer-encoded) starting at 'offset'.
+    Returns (string, new_offset).
+    """
+    length, is_special, offset = read_length(data, offset)
+    if is_special:
+        int_sizes = {0: 1, 1: 2, 2: 4}  # 8, 16 and 32-bit ints; 3 is LZF
+        if length not in int_sizes:
+            raise ValueError("LZF-compressed strings are not supported")
+        raw, offset = read_bytes(data, offset, int_sizes[length])
+        return str(int.from_bytes(raw, "little", signed=True)), offset
+
+    raw, offset = read_bytes(data, offset, length)
+    return raw.decode("utf-8"), offset
+
+
 def parse_metadata(data):
     """
-    Parse the metadata portion of the RDB-like content.
+    Parse everything after the 9-byte header of the RDB-like content.
     Updates global 'meta_data', 'global_hashmap', and 'expiry_hashmap' as needed.
     Returns leftover bytes if any.
     """
     offset = 0
-    while offset < len(data):
-        marker = data[offset]
-        offset += 1
+    try:
+        while offset < len(data):
+            marker = data[offset]
+            offset += 1
 
-        if marker == 0xFA:
-            # Parse metadata attribute (e.g. version info)
-            try:
-                name_length = data[offset]
-                offset += 1
-                name = data[offset:offset + name_length].decode('utf-8')
-                offset += name_length
-
-                value_length = data[offset]
-                offset += 1
-
-                # Special encoding or plain string?
-                if value_length & 0xC0 == 0xC0:
-                    encoding_type = value_length & 0x3F
-                    if encoding_type == 0:  # 8-bit int
-                        value = str(data[offset])
-                        offset += 1
-                    elif encoding_type == 1:  # 16-bit int
-                        value = str(int.from_bytes(data[offset:offset + 2], "little"))
-                        offset += 2
-                    elif encoding_type == 2:  # 32-bit int
-                        value = str(int.from_bytes(data[offset:offset + 4], "little"))
-                        offset += 4
-                    else:
-                        raise ValueError(f"Unsupported encoding: {encoding_type}")
-                else:
-                    value = data[offset:offset + value_length].decode('utf-8')
-                    offset += value_length
-
+            if marker == 0xFA:
+                # Metadata attribute (e.g. version info)
+                name, offset = read_string(data, offset)
+                value, offset = read_string(data, offset)
                 meta_data[name] = value
                 print(f"Key: {name}, Value: {value}")
 
-            except IndexError:
-                print("Error: Ran out of data while parsing metadata.")
-                break
-
-        elif marker == 0xFE:
-            # DB index marker
-            try:
-                db_index = data[offset]
-                offset += 1
+            elif marker == 0xFE:
+                # DB index marker
+                db_index, _, offset = read_length(data, offset)
                 print(f"Database Index: {db_index}")
-            except IndexError:
-                print("Error: Ran out of data while parsing DB index.")
-                break
 
-        elif marker == 0xFB:
-            # Parse the main hash table
-            try:
-                main_hash_size = data[offset]
-                offset += 1
+            elif marker == 0xFB:
+                # Hash table size hints; the entries follow as individual records, in any order
+                main_hash_size, _, offset = read_length(data, offset)
+                expiry_hash_size, _, offset = read_length(data, offset)
                 print(f"Main Hash Table Size: {main_hash_size}")
-
-                expiry_hash_size = data[offset]
-                offset += 1
                 print(f"Expiry Hash Table Size: {expiry_hash_size}")
 
-                # We'll read (main_hash_size - expiry_hash_size) keys
-                for _ in range(expiry_hash_size, main_hash_size):
-                    if data[offset] != 0x00:
-                        print("Non-string data type")
-                    offset += 1
-
-                    key_length = data[offset]
-                    offset += 1
-                    key = data[offset:offset + key_length].decode("utf-8")
-                    offset += key_length
-
-                    value_length = data[offset]
-                    offset += 1
-                    value = data[offset:offset + value_length].decode("utf-8")
-                    offset += value_length
-
-                    global_hashmap[key] = value
-                    print(f"Key: {key}, Value: {value}")
-
-            except IndexError:
-                print("Error: Ran out of data while parsing main hash table.")
-
-        elif marker in (0xFC, 0xFD):
-            # Parse expiration data
-            try:
+            elif marker in (0xFC, 0xFD):
+                # Key with expiration
                 if marker == 0xFC:  # Milliseconds
-                    expiry_timestamp = int.from_bytes(data[offset:offset + 8], "little") / 1000
-                    offset += 8
+                    raw, offset = read_bytes(data, offset, 8)
+                    expiry_timestamp = int.from_bytes(raw, "little") / 1000
                 else:  # marker == 0xFD, Seconds
-                    expiry_timestamp = int.from_bytes(data[offset:offset + 4], "little")
-                    offset += 4
+                    raw, offset = read_bytes(data, offset, 4)
+                    expiry_timestamp = int.from_bytes(raw, "little")
 
                 value_type = data[offset]
                 offset += 1
@@ -109,35 +99,31 @@ def parse_metadata(data):
                     print(f"Unsupported value type: {value_type}")
                     break
 
-                key_length = data[offset]
-                offset += 1
-                key = data[offset:offset + key_length].decode("utf-8")
-                offset += key_length
-
-                value_length = data[offset]
-                offset += 1
-                value = data[offset:offset + value_length].decode("utf-8")
-                offset += value_length
-
+                key, offset = read_string(data, offset)
+                value, offset = read_string(data, offset)
                 global_hashmap[key] = value
                 expiry_hashmap[key] = expiry_timestamp
                 print(f"Key: {key}, Value: {value}, Expiration: {expiry_timestamp}")
 
-            except IndexError:
-                print("Error: Ran out of data while parsing expiration data.")
+            elif marker == 0x00:
+                # String key without expiration
+                key, offset = read_string(data, offset)
+                value, offset = read_string(data, offset)
+                global_hashmap[key] = value
+                print(f"Key: {key}, Value: {value}")
 
-        elif marker == 0xFF:
-            # End of file (plus checksum)
-            try:
-                checksum_stored = int.from_bytes(data[offset:offset + 8], "little")
-                offset += 8
-                print(f"End of file. Checksum (stored): {checksum_stored:#018x}")
+            elif marker == 0xFF:
+                # End of file (plus checksum)
+                raw, offset = read_bytes(data, offset, 8)
+                print(f"End of file. Checksum (stored): {int.from_bytes(raw, 'little'):#018x}")
                 break
-            except IndexError:
-                print("Error: Insufficient data for checksum.")
-        else:
-            print("Unknown marker:", hex(marker))
-            break
+
+            else:
+                print("Unsupported marker or value type:", hex(marker))
+                break
+
+    except (IndexError, ValueError) as e:
+        print(f"Error parsing RDB data: {e}")
 
     return data[offset:]
 
