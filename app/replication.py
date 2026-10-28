@@ -140,10 +140,6 @@ async def connect_to_master(host, port):
                         print(get_ack_offset)
 
                         # Keep reading subsequent replication commands
-                        from parsers import parse_input  # local import to avoid issues
-                        from globals import global_hashmap, expiry_hashmap
-                        import time
-
                         while True:
                             response = await reader.read(1024)
                             get_ack_offset += len(response)
