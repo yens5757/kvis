@@ -1,10 +1,19 @@
 import asyncio
 
-from parsers import parse_input, IncompleteError
+from parsers import parse_input, IncompleteError, encode_bulk_string, encode_array
 from replication import write_to_slave, slave_read_loop, wait_for_slaves
 from globals import slaves, slaves_write_count
 from config import server_config
 from store import apply_set, get_value, live_keys
+
+MASTER_REPLID = "8371b4fb1155b71f4a04d3e1bc3e18c4a990aeeb"
+
+# Empty RDB file sent to slaves on a full resync
+EMPTY_RDB = bytes.fromhex(
+    "524544495330303131fa0972656469732d76657205372e322e30fa0a72656469732d62697473c040"
+    "fa056374696d65c26d08bc65fa08757365642d6d656dc2b0c41000fa08616f662d62617365c000fff06e"
+    "3bfec0ff5aa2"
+)
 
 
 async def handle_client(reader, writer):
@@ -49,7 +58,7 @@ async def handle_command(result, raw, reader, writer):
 
     # ECHO
     if cmd == "ECHO":
-        writer.write(f"+{result[1]}\r\n".encode())
+        writer.write(encode_bulk_string(result[1]))
         await writer.drain()
 
     # PING
@@ -66,43 +75,31 @@ async def handle_command(result, raw, reader, writer):
 
     # GET
     elif cmd == "GET":
-        val = get_value(result[1])
-        if val is not None:
-            writer.write(f"${len(val)}\r\n{val}\r\n".encode())
-        else:
-            writer.write(b"$-1\r\n")
+        writer.write(encode_bulk_string(get_value(result[1])))
         await writer.drain()
 
     # CONFIG GET
     elif cmd == "CONFIG" and result[1].upper() == "GET":
-        if result[2].lower() == "dir":
-            d = server_config["dir"] or ""
-            writer.write(f"*2\r\n$3\r\ndir\r\n${len(d)}\r\n{d}\r\n".encode())
-        elif result[2].lower() == "dbfilename":
-            db = server_config["dbfilename"] or ""
-            writer.write(f"*2\r\n$10\r\ndbfilename\r\n${len(db)}\r\n{db}\r\n".encode())
+        param = result[2].lower()
+        if param in ("dir", "dbfilename"):
+            writer.write(encode_array([param, server_config[param] or ""]))
         await writer.drain()
 
     # KEYS
     elif cmd == "KEYS":
         if result[1] == "*":
-            keys = live_keys()
-            resp = f"*{len(keys)}\r\n"
-            for k in keys:
-                resp += f"${len(k)}\r\n{k}\r\n"
-            writer.write(resp.encode())
+            writer.write(encode_array(live_keys()))
             await writer.drain()
 
     # INFO
     elif cmd == "INFO":
         if server_config["replicaof"]:
             # Slave info
-            writer.write(b"$10\r\nrole:slave\r\n")
+            info = "role:slave"
         else:
             # Master info
-            writer.write(
-                b"$87\r\nrole:master:master_replid:8371b4fb1155b71f4a04d3e1bc3e18c4a990aeeb:master_repl_offset:0\r\n"
-            )
+            info = f"role:master\r\nmaster_replid:{MASTER_REPLID}\r\nmaster_repl_offset:0"
+        writer.write(encode_bulk_string(info))
         await writer.drain()
 
     # REPLCONF
@@ -115,17 +112,10 @@ async def handle_command(result, raw, reader, writer):
     # PSYNC
     elif cmd == "PSYNC":
         # Full sync scenario
-        writer.write(b"+FULLRESYNC 8371b4fb1155b71f4a04d3e1bc3e18c4a990aeeb 0\r\n")
+        writer.write(f"+FULLRESYNC {MASTER_REPLID} 0\r\n".encode())
         await writer.drain()
 
-        # Sample RDB payload
-        resp = b"$88\r\n"
-        resp += bytes.fromhex(
-            "524544495330303131fa0972656469732d76657205372e322e30fa0a72656469732d62697473c040"
-            "fa056374696d65c26d08bc65fa08757365642d6d656dc2b0c41000fa08616f662d62617365c000fff06e"
-            "3bfec0ff5aa2"
-        )
-        writer.write(resp)
+        writer.write(f"${len(EMPTY_RDB)}\r\n".encode() + EMPTY_RDB)
         await writer.drain()
         return True
 

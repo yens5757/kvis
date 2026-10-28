@@ -50,3 +50,20 @@ def parse_input(data):
 
     else:
         raise ValueError("Unknown RESP type")
+
+
+def encode_bulk_string(value):
+    """
+    Encode a str (or None for a null bulk string) as a RESP bulk string.
+    """
+    if value is None:
+        return b"$-1\r\n"
+    data = value.encode()
+    return b"$" + str(len(data)).encode() + b"\r\n" + data + b"\r\n"
+
+
+def encode_array(items):
+    """
+    Encode a list of str as a RESP array of bulk strings.
+    """
+    return f"*{len(items)}\r\n".encode() + b"".join(encode_bulk_string(item) for item in items)
