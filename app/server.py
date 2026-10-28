@@ -3,7 +3,8 @@ import time
 
 from parsers import parse_input
 from replication import write_to_slave, slave_read_loop, wait_for_slaves
-from globals import global_hashmap, expiry_hashmap, slaves, server_config, slaves_write_count
+from globals import global_hashmap, expiry_hashmap, slaves, slaves_write_count
+from config import server_config
 
 
 async def handle_client(reader, writer):
