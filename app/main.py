@@ -1,7 +1,8 @@
 import argparse
 import asyncio
+import os
 
-from config import server_config, is_file_in_dir
+from config import server_config
 from rdb import read_file
 from server import start_server
 
@@ -21,7 +22,7 @@ if __name__ == "__main__":
 
     # If we have a db file in the specified directory, read it
     if server_config["dir"] and server_config["dbfilename"] and \
-       is_file_in_dir(server_config["dir"], server_config["dbfilename"]):
+       os.path.isfile(os.path.join(server_config["dir"], server_config["dbfilename"])):
         print("Reading RDB file...")
         read_file(server_config["dir"], server_config["dbfilename"])
 

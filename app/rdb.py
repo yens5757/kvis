@@ -1,7 +1,10 @@
 import os
 
-from globals import meta_data, global_hashmap, expiry_hashmap
-from config import server_config
+from store import set_key
+
+# Auxiliary fields (e.g. redis-ver) from the last RDB file loaded.
+meta_data = {}
+
 
 def read_bytes(data, offset, size):
     """
@@ -53,10 +56,10 @@ def read_string(data, offset):
     return raw.decode("utf-8"), offset
 
 
-def parse_metadata(data):
+def parse_rdb_body(data):
     """
     Parse everything after the 9-byte header of the RDB-like content.
-    Updates global 'meta_data', 'global_hashmap', and 'expiry_hashmap' as needed.
+    Stores keys in the key-value store and aux fields in 'meta_data'.
     Returns leftover bytes if any.
     """
     offset = 0
@@ -101,15 +104,14 @@ def parse_metadata(data):
 
                 key, offset = read_string(data, offset)
                 value, offset = read_string(data, offset)
-                global_hashmap[key] = value
-                expiry_hashmap[key] = expiry_timestamp
+                set_key(key, value, expiry_timestamp)
                 print(f"Key: {key}, Value: {value}, Expiration: {expiry_timestamp}")
 
             elif marker == 0x00:
                 # String key without expiration
                 key, offset = read_string(data, offset)
                 value, offset = read_string(data, offset)
-                global_hashmap[key] = value
+                set_key(key, value)
                 print(f"Key: {key}, Value: {value}")
 
             elif marker == 0xFF:
@@ -145,7 +147,7 @@ def load_rdb(rdb_content):
         return
 
     # Parse the remainder of the file
-    parse_metadata(rdb_content[9:])
+    parse_rdb_body(rdb_content[9:])
 
 
 def read_file(directory, filename):

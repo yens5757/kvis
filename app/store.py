@@ -1,6 +1,22 @@
 import time
 
-from globals import global_hashmap, expiry_hashmap
+# The main in-memory key-value store.
+global_hashmap = {}
+
+# The in-memory expiry map. key -> float(timestamp in seconds).
+expiry_hashmap = {}
+
+
+def set_key(key, value, expires_at=None):
+    """
+    Store 'value' at 'key', expiring at the unix timestamp 'expires_at' (seconds) if given.
+    """
+    global_hashmap[key] = value
+    if expires_at is None:
+        # A plain SET clears any expiry left over from an earlier SET ... px
+        expiry_hashmap.pop(key, None)
+    else:
+        expiry_hashmap[key] = expires_at
 
 
 def apply_set(args):
@@ -15,12 +31,7 @@ def apply_set(args):
             raise ValueError("syntax error")
         expires_at = time.time() + int(args[4]) / 1000
 
-    global_hashmap[key] = value
-    if expires_at is None:
-        # A plain SET clears any expiry left over from an earlier SET ... px
-        expiry_hashmap.pop(key, None)
-    else:
-        expiry_hashmap[key] = expires_at
+    set_key(key, value, expires_at)
 
 
 def get_value(key):

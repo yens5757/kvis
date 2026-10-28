@@ -1,20 +1,13 @@
 import asyncio
 import fnmatch
 
-from parsers import read_value, encode_bulk_string, encode_array
-from replication import write_to_slave, slave_read_loop, wait_for_slaves, get_repl_offset
-from globals import slaves
+from resp import read_value, encode_bulk_string, encode_array
+from replication import (
+    MASTER_REPLID, connect_to_master, get_repl_offset, start_full_resync, wait_for_slaves,
+    write_to_slave,
+)
 from config import server_config
 from store import apply_set, get_value, live_keys
-
-MASTER_REPLID = "8371b4fb1155b71f4a04d3e1bc3e18c4a990aeeb"
-
-# Empty RDB file sent to slaves on a full resync
-EMPTY_RDB = bytes.fromhex(
-    "524544495330303131fa0972656469732d76657205372e322e30fa0a72656469732d62697473c040"
-    "fa056374696d65c26d08bc65fa08757365642d6d656dc2b0c41000fa08616f662d62617365c000fff06e"
-    "3bfec0ff5aa2"
-)
 
 
 async def handle_client(reader, writer):
@@ -35,8 +28,7 @@ async def handle_client(reader, writer):
                 continue
 
             if became_slave:
-                # This connection now belongs to a slave; any unread bytes stay in 'reader'
-                asyncio.create_task(slave_read_loop(reader, writer))
+                # The replication code now owns this connection
                 return
 
     except asyncio.IncompleteReadError:
@@ -115,15 +107,7 @@ async def handle_command(result, raw, reader, writer):
 
     # PSYNC
     elif cmd == "PSYNC":
-        # Full sync scenario
-        writer.write(f"+FULLRESYNC {MASTER_REPLID} {get_repl_offset()}\r\n".encode())
-        await writer.drain()
-
-        writer.write(f"${len(EMPTY_RDB)}\r\n".encode() + EMPTY_RDB)
-        await writer.drain()
-
-        # Only register the slave once it has the RDB, so no writes are forwarded mid-handshake
-        slaves[(reader, writer)] = get_repl_offset()
+        await start_full_resync(reader, writer)
         return True
 
     # WAIT
@@ -153,7 +137,6 @@ async def start_server():
 
     async with srv:
         if server_config["replicaof"]:
-            from replication import connect_to_master
             host, master_port = server_config["replicaof"].split()
             asyncio.create_task(connect_to_master(host, int(master_port), port))
         await srv.serve_forever()

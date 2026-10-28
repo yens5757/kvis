@@ -1,10 +1,22 @@
 import asyncio
 import time
 
-from parsers import read_value, read_rdb_payload, encode_array
-from globals import slaves
+from resp import read_value, read_rdb_payload, encode_array
 from rdb import load_rdb
 from store import apply_set
+
+MASTER_REPLID = "8371b4fb1155b71f4a04d3e1bc3e18c4a990aeeb"
+
+# Empty RDB file sent to slaves on a full resync
+EMPTY_RDB = bytes.fromhex(
+    "524544495330303131fa0972656469732d76657205372e322e30fa0a72656469732d62697473c040"
+    "fa056374696d65c26d08bc65fa08757365642d6d656dc2b0c41000fa08616f662d62617365c000fff06e"
+    "3bfec0ff5aa2"
+)
+
+# Connected slaves. Keys are (reader, writer) pairs, values are the last replication
+# offset each slave acknowledged.
+slaves = {}
 
 # Total bytes this master has propagated to its slaves.
 repl_offset = 0
@@ -12,6 +24,22 @@ repl_offset = 0
 
 def get_repl_offset():
     return repl_offset
+
+
+async def start_full_resync(reader, writer):
+    """
+    Answer a slave's PSYNC with a full resync, then register the connection as a slave
+    and read its ACKs in the background.
+    """
+    writer.write(f"+FULLRESYNC {MASTER_REPLID} {repl_offset}\r\n".encode())
+    await writer.drain()
+
+    writer.write(f"${len(EMPTY_RDB)}\r\n".encode() + EMPTY_RDB)
+    await writer.drain()
+
+    # Only register the slave once it has the RDB, so no writes are forwarded mid-handshake
+    slaves[(reader, writer)] = repl_offset
+    asyncio.create_task(slave_read_loop(reader, writer))
 
 
 async def slave_read_loop(reader, writer):
