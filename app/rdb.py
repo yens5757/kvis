@@ -128,25 +128,30 @@ def parse_metadata(data):
     return data[offset:]
 
 
+def load_rdb(rdb_content):
+    """
+    Validate the RDB header and load the contents into memory.
+    Used both for the file loaded at startup and the RDB a master sends to a replica.
+    """
+    header = rdb_content[:9].decode('ascii', errors='replace')
+    magic, version = header[:5], header[5:]
+    print(f"Magic: {magic}, Version: {version}")
+
+    if magic != "REDIS":
+        print("Error: Magic header is not 'REDIS'")
+        return
+    if not version.isdigit():
+        print("Error: Version is not numeric")
+        return
+
+    # Parse the remainder of the file
+    parse_metadata(rdb_content[9:])
+
+
 def read_file(directory, filename):
     """
     Read and parse an RDB-like file from directory/filename.
     """
     file_path = os.path.join(directory, filename)
     with open(file_path, 'rb') as file:
-        rdb_content = file.read()
-        print(rdb_content)
-
-        header = rdb_content[:9].decode('ascii')
-        magic, version = header[:5], header[5:]
-        print(f"Magic: {magic}, Version: {version}")
-
-        if magic != "REDIS":
-            print("Error: Magic header is not 'REDIS'")
-            return
-        if not version.isdigit():
-            print("Error: Version is not numeric")
-            return
-
-        # Parse the remainder of the file
-        parse_metadata(rdb_content[9:])
+        load_rdb(file.read())

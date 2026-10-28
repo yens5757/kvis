@@ -167,5 +167,5 @@ async def start_server():
         if server_config["replicaof"]:
             from replication import connect_to_master
             host, master_port = server_config["replicaof"].split()
-            asyncio.create_task(connect_to_master(host, int(master_port)))
+            asyncio.create_task(connect_to_master(host, int(master_port), port))
         await srv.serve_forever()

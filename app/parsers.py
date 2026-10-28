@@ -52,6 +52,28 @@ def parse_input(data):
         raise ValueError("Unknown RESP type")
 
 
+def parse_rdb_payload(data):
+    """
+    Parse the RDB file a master sends after FULLRESYNC: "$<length>\\r\\n" followed by
+    exactly <length> raw bytes, with no trailing CRLF.
+    Returns (rdb_bytes, leftover_bytes).
+    """
+    if not data:
+        raise IncompleteError()
+    if data[0:1] != b"$":
+        raise ValueError("Expected RDB payload from master")
+
+    line_end = data.find(b"\r\n")
+    if line_end == -1:
+        raise IncompleteError()
+
+    length = int(data[1:line_end])
+    start = line_end + 2
+    if len(data) < start + length:
+        raise IncompleteError()
+    return data[start:start + length], data[start + length:]
+
+
 def encode_bulk_string(value):
     """
     Encode a str (or None for a null bulk string) as a RESP bulk string.
